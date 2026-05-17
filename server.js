@@ -11,14 +11,25 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
 
 // Rate Limiting - Protección contra DoS y scraping
+// Solo aplica a rutas de API, NO a archivos estáticos (CSS, JS, imágenes, etc.)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
-  max: IS_PRODUCTION ? 100 : 1000, // 100 requests por IP en producción, 1000 en dev
+  max: IS_PRODUCTION ? 500 : 2000, // 500 requests por IP en producción, 2000 en dev
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' }
 });
-app.use(limiter);
+
+// Middleware para excluir archivos estáticos del rate limiting
+const rateLimitMiddleware = (req, res, next) => {
+  // Si es un archivo estático, saltar rate limiting
+  if (req.path.match(/\.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|json|mp3|mp4|webm|ogg)$/)) {
+    return next();
+  }
+  limiter(req, res, next);
+};
+
+app.use(rateLimitMiddleware);
 
 // CORS - Restringido a orígenes específicos
 const allowedOrigins = process.env.ALLOWED_ORIGINS 
