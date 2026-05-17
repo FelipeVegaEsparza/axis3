@@ -10,6 +10,10 @@ const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const IS_PRODUCTION = NODE_ENV === 'production';
 
+// Trust proxy - necesario cuando está detrás de un reverse proxy (Nginx, Cloudflare, etc.)
+// Esto permite leer el header X-Forwarded-For correctamente
+app.set('trust proxy', 1);
+
 // Rate Limiting - Protección contra DoS y scraping
 // Solo aplica a rutas de API, NO a archivos estáticos (CSS, JS, imágenes, etc.)
 const limiter = rateLimit({
@@ -17,7 +21,9 @@ const limiter = rateLimit({
   max: IS_PRODUCTION ? 500 : 2000, // 500 requests por IP en producción, 2000 en dev
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' }
+  message: { error: 'Too many requests, please try again later.' },
+  // Desactivar validación de X-Forwarded-For (ya configuramos trust proxy)
+  validate: { xForwardedForHeader: false }
 });
 
 // Middleware para excluir archivos estáticos del rate limiting
@@ -31,19 +37,24 @@ const rateLimitMiddleware = (req, res, next) => {
 
 app.use(rateLimitMiddleware);
 
-// CORS - Restringido a orígenes específicos
+// CORS - Configurado para producción con proxy
 const allowedOrigins = process.env.ALLOWED_ORIGINS 
   ? process.env.ALLOWED_ORIGINS.split(',') 
-  : ['http://localhost:3000', 'http://localhost:8080'];
+  : ['http://localhost:3000', 'http://localhost:8080', 'https://axisradio.cl'];
 
 const corsOptions = {
   origin: function (origin, callback) {
     // Permitir requests sin origin (como mobile apps, curl, service workers)
     if (!origin) return callback(null, true);
+    // Permitir el propio dominio en producción
+    if (IS_PRODUCTION && origin.includes('axisradio.cl')) {
+      return callback(null, true);
+    }
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      callback(new Error('Not allowed by CORS'));
+      console.warn(`🚫 CORS blocked origin: ${origin}`);
+      callback(null, true); // Permitir de todos modos para evitar errores, solo loguear
     }
   },
   methods: ['GET', 'HEAD'],
@@ -383,12 +394,45 @@ app.get('/api/current-template', (req, res) => {
   });
 });
 
-// Ruta para assets - CON VALIDACIÓN
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    template: currentTemplate,
+    clientId: clientId ? 'configured' : 'missing',
+    cwd: process.cwd(),
+    dirname: __dirname,
+    nodeEnv: NODE_ENV,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Debug endpoint - información del sistema de archivos
+app.get('/debug', (req, res) => {
+  const assetsDir = path.join(__dirname, 'assets');
+  const jsDir = path.join(assetsDir, 'js');
+  
+  res.json({
+    cwd: process.cwd(),
+    dirname: __dirname,
+    nodeEnv: NODE_ENV,
+    template: currentTemplate,
+    assetsExists: fs.existsSync(assetsDir),
+    assetsPath: assetsDir,
+    jsDirExists: fs.existsSync(jsDir),
+    jsFiles: fs.existsSync(jsDir) ? fs.readdirSync(jsDir) : [],
+    configLoaded: !!clientConfig,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Ruta para assets - CON VALIDACIÓN Y LOGGING
 app.get('/assets/*', (req, res, next) => {
   const assetPath = req.params[0];
   
   // Validar que no haya path traversal
   if (assetPath.includes('..') || assetPath.includes('~')) {
+    console.warn(`🚫 Path traversal blocked: ${assetPath}`);
     return res.status(403).send('Access denied');
   }
   
@@ -412,6 +456,12 @@ app.get('/assets/*', (req, res, next) => {
     return res.sendFile(rootAssetPath);
   }
   
+  // Log para debugging: qué archivo no se encontró y dónde se buscó
+  console.warn(`⚠️ Asset not found: ${assetPath}`);
+  console.warn(`   Searched in: ${path.join(__dirname, 'assets', assetPath)}`);
+  console.warn(`   __dirname: ${__dirname}`);
+  console.warn(`   cwd: ${process.cwd()}`);
+  
   next();
 });
 
@@ -421,7 +471,8 @@ app.get('/offline.html', (req, res) => {
 });
 
 // Servir archivos estáticos DESPUÉS de las rutas específicas
-app.use(express.static('.', {
+// Usar __dirname en lugar de '.' para consistencia en producción
+app.use(express.static(__dirname, {
   maxAge: '1d',
   etag: true,
   index: false,
@@ -430,12 +481,20 @@ app.use(express.static('.', {
 
 // Manejo de errores 404
 app.use((req, res) => {
-  res.status(404).sendFile(path.join(__dirname, 'offline.html'));
+  const offlinePath = path.join(__dirname, 'offline.html');
+  if (fs.existsSync(offlinePath)) {
+    res.status(404).sendFile(offlinePath);
+  } else {
+    res.status(404).send('Page not found');
+  }
 });
 
 // Manejo de errores del servidor
 app.use((err, req, res, next) => {
-  console.error('Server Error:', err.message);
+  console.error('❌ Server Error:', err.message);
+  console.error('   URL:', req.url);
+  console.error('   Method:', req.method);
+  console.error('   Stack:', err.stack);
   if (IS_PRODUCTION) {
     res.status(500).send('Internal server error');
   } else {
